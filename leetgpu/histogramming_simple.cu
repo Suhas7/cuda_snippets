@@ -43,6 +43,5 @@ void solve(const int* input, int* histogram, int N, int num_bins) {
     reduce_histogram<<<reduceBlocks, threadsPerBlock>>>(blockResults, histogram, numBlocks, num_bins);
     cudaDeviceSynchronize();
 
-    // Clean up
     cudaFree(blockResults);
 }
