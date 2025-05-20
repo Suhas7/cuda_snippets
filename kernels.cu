@@ -18,6 +18,31 @@ torch::Tensor conv1d(torch::Tensor input, torch::Tensor kernel) {
     return out;
 }
 
+__global__ void k_conv2d(const float* in, const float* ker, float* out,
+                         int H, int W, int KH, int KW) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int outH = H-KH+1, outW = W-KW+1;
+    if (row >= outH || col >= outW) return;
+    float s = 0;
+    for (int i = 0; i < KH; i++)
+        for (int j = 0; j < KW; j++)
+            s += in[(row+i)*W + col+j] * ker[i*KW+j];
+    out[row*outW+col] = s;
+}
+
+torch::Tensor conv2d(torch::Tensor input, torch::Tensor kernel) {
+    int H = input.size(0), W = input.size(1);
+    int KH = kernel.size(0), KW = kernel.size(1);
+    auto out = torch::zeros({H-KH+1, W-KW+1}, input.options());
+    dim3 threads(16, 16);
+    dim3 blocks((W-KW+1+15)/16, (H-KH+1+15)/16);
+    k_conv2d<<<blocks, threads>>>(
+        input.data_ptr<float>(), kernel.data_ptr<float>(), out.data_ptr<float>(), H, W, KH, KW);
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("conv1d", &conv1d);
+    m.def("conv2d", &conv2d);
 }
