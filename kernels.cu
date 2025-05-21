@@ -42,7 +42,27 @@ torch::Tensor conv2d(torch::Tensor input, torch::Tensor kernel) {
     return out;
 }
 
+__global__ void k_matmul(const float* A, const float* B, float* C, int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= K) return;
+    float s = 0;
+    for (int n = 0; n < N; n++) s += A[row*N+n] * B[n*K+col];
+    C[row*K+col] = s;
+}
+
+torch::Tensor matmul(torch::Tensor A, torch::Tensor B) {
+    int M = A.size(0), N = A.size(1), K = B.size(1);
+    auto C = torch::zeros({M, K}, A.options());
+    dim3 threads(16, 16);
+    dim3 blocks((K+15)/16, (M+15)/16);
+    k_matmul<<<blocks, threads>>>(
+        A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, N, K);
+    return C;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("conv1d", &conv1d);
     m.def("conv2d", &conv2d);
+    m.def("matmul", &matmul);
 }
