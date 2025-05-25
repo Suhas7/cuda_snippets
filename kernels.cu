@@ -61,8 +61,69 @@ torch::Tensor matmul(torch::Tensor A, torch::Tensor B) {
     return C;
 }
 
+__global__ void k_reduce_max(const float* in, float* out, int N) {
+    __shared__ float tmp[1024];
+    int tid = threadIdx.x, idx = blockIdx.x * blockDim.x + tid;
+    tmp[tid] = idx < N ? in[idx] : -INFINITY;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) tmp[tid] = fmaxf(tmp[tid], tmp[tid+s]);
+        __syncthreads();
+    }
+    if (tid == 0) out[blockIdx.x] = tmp[0];
+}
+
+__global__ void k_reduce_sum(const float* in, float* out, int N) {
+    __shared__ float tmp[1024];
+    int tid = threadIdx.x, idx = blockIdx.x * blockDim.x + tid;
+    tmp[tid] = idx < N ? in[idx] : 0.f;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) tmp[tid] += tmp[tid+s];
+        __syncthreads();
+    }
+    if (tid == 0) out[blockIdx.x] = tmp[0];
+}
+
+__global__ void k_sub_exp(const float* in, float* out, int N, float c) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) out[i] = expf(in[i] - c);
+}
+
+__global__ void k_div(float* x, int N, float c) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) x[i] /= c;
+}
+
+static float device_scalar(const float* d, int N, bool use_max) {
+    auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+    int b = (N + 1023) / 1024;
+    auto tmp = torch::empty({b}, opts);
+    if (use_max) k_reduce_max<<<b, 1024>>>(d, tmp.data_ptr<float>(), N);
+    else         k_reduce_sum<<<b, 1024>>>(d, tmp.data_ptr<float>(), N);
+    if (b > 1) {
+        auto tmp2 = torch::empty({1}, opts);
+        if (use_max) k_reduce_max<<<1, 1024>>>(tmp.data_ptr<float>(), tmp2.data_ptr<float>(), b);
+        else         k_reduce_sum<<<1, 1024>>>(tmp.data_ptr<float>(), tmp2.data_ptr<float>(), b);
+        float v; cudaMemcpy(&v, tmp2.data_ptr<float>(), sizeof(float), cudaMemcpyDeviceToHost); return v;
+    }
+    float v; cudaMemcpy(&v, tmp.data_ptr<float>(), sizeof(float), cudaMemcpyDeviceToHost); return v;
+}
+
+torch::Tensor softmax(torch::Tensor input) {
+    int N = input.size(0);
+    auto out = torch::empty_like(input);
+    int blocks = (N + BS-1) / BS;
+    float mx = device_scalar(input.data_ptr<float>(), N, true);
+    k_sub_exp<<<blocks, BS>>>(input.data_ptr<float>(), out.data_ptr<float>(), N, mx);
+    float sm = device_scalar(out.data_ptr<float>(), N, false);
+    k_div<<<blocks, BS>>>(out.data_ptr<float>(), N, sm);
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv1d", &conv1d);
-    m.def("conv2d", &conv2d);
-    m.def("matmul", &matmul);
+    m.def("conv1d",  &conv1d);
+    m.def("conv2d",  &conv2d);
+    m.def("matmul",  &matmul);
+    m.def("softmax", &softmax);
 }
