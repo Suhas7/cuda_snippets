@@ -11,6 +11,7 @@ __global__ void k_conv1d(const float* in, const float* ker, float* out, int N, i
 }
 
 torch::Tensor conv1d(torch::Tensor input, torch::Tensor kernel) {
+    input = input.contiguous(); kernel = kernel.contiguous();
     int N = input.size(0), K = kernel.size(0);
     auto out = torch::zeros({N-K+1}, input.options());
     k_conv1d<<<(N-K+1+BS-1)/BS, BS>>>(
@@ -32,6 +33,7 @@ __global__ void k_conv2d(const float* in, const float* ker, float* out,
 }
 
 torch::Tensor conv2d(torch::Tensor input, torch::Tensor kernel) {
+    input = input.contiguous(); kernel = kernel.contiguous();
     int H = input.size(0), W = input.size(1);
     int KH = kernel.size(0), KW = kernel.size(1);
     auto out = torch::zeros({H-KH+1, W-KW+1}, input.options());
@@ -52,6 +54,7 @@ __global__ void k_matmul(const float* A, const float* B, float* C, int M, int N,
 }
 
 torch::Tensor matmul(torch::Tensor A, torch::Tensor B) {
+    A = A.contiguous(); B = B.contiguous();
     int M = A.size(0), N = A.size(1), K = B.size(1);
     auto C = torch::zeros({M, K}, A.options());
     dim3 threads(16, 16);
@@ -111,6 +114,7 @@ static float device_scalar(const float* d, int N, bool use_max) {
 }
 
 torch::Tensor softmax(torch::Tensor input) {
+    input = input.contiguous();
     int N = input.size(0);
     auto out = torch::empty_like(input);
     int blocks = (N + BS-1) / BS;
