@@ -125,9 +125,80 @@ torch::Tensor softmax(torch::Tensor input) {
     return out;
 }
 
+
+// ── Attention kernels ────────────────────────────────────────────────────────
+
+#define ATTN_TILE 16
+#define ATTN_Bc   32
+
+// Naive attention: materializes the full N×N score matrix
+__global__ void k_qkt(const float* Q, const float* K, float* S, int N, int d) {
+    __shared__ float tQ[ATTN_TILE][ATTN_TILE], tK[ATTN_TILE][ATTN_TILE];
+    int row = blockIdx.y * ATTN_TILE + threadIdx.y;
+    int col = blockIdx.x * ATTN_TILE + threadIdx.x;
+    float acc = 0.f;
+    for (int t = 0; t < (d + ATTN_TILE - 1) / ATTN_TILE; t++) {
+        tQ[threadIdx.y][threadIdx.x] = (row < N && t*ATTN_TILE+threadIdx.x < d) ? Q[row*d + t*ATTN_TILE+threadIdx.x] : 0.f;
+        tK[threadIdx.x][threadIdx.y] = (col < N && t*ATTN_TILE+threadIdx.y < d) ? K[col*d + t*ATTN_TILE+threadIdx.y] : 0.f;
+        __syncthreads();
+        for (int k = 0; k < ATTN_TILE; k++) acc += tQ[threadIdx.y][k] * tK[threadIdx.x][k];
+        __syncthreads();
+    }
+    if (row < N && col < N) S[row*N + col] = acc * rsqrtf((float)d);
+}
+
+__global__ void k_row_softmax(float* S, int N) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= N) return;
+    float* s = S + row * N;
+    float m = -INFINITY;
+    for (int j = 0; j < N; j++) m = fmaxf(m, s[j]);
+    float sum = 0.f;
+    for (int j = 0; j < N; j++) { s[j] = expf(s[j] - m); sum += s[j]; }
+    for (int j = 0; j < N; j++) s[j] /= sum;
+}
+
+__global__ void k_sv(const float* S, const float* V, float* O, int N, int d) {
+    __shared__ float tS[ATTN_TILE][ATTN_TILE], tV[ATTN_TILE][ATTN_TILE];
+    int row = blockIdx.y * ATTN_TILE + threadIdx.y;
+    int col = blockIdx.x * ATTN_TILE + threadIdx.x;
+    float acc = 0.f;
+    for (int t = 0; t < (N + ATTN_TILE - 1) / ATTN_TILE; t++) {
+        tS[threadIdx.y][threadIdx.x] = (row < N && t*ATTN_TILE+threadIdx.x < N) ? S[row*N + t*ATTN_TILE+threadIdx.x] : 0.f;
+        tV[threadIdx.y][threadIdx.x] = (t*ATTN_TILE+threadIdx.y < N && col < d) ? V[(t*ATTN_TILE+threadIdx.y)*d + col] : 0.f;
+        __syncthreads();
+        for (int k = 0; k < ATTN_TILE; k++) acc += tS[threadIdx.y][k] * tV[k][threadIdx.x];
+        __syncthreads();
+    }
+    if (row < N && col < d) O[row*d + col] = acc;
+}
+
+torch::Tensor attention_naive(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
+    Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous();
+    int N = Q.size(0), d = Q.size(1);
+    auto opts = Q.options();
+    auto S = torch::zeros({N, N}, opts);
+    auto O = torch::zeros({N, d}, opts);
+
+    // Compute scaled QK^T
+    dim3 threads(ATTN_TILE, ATTN_TILE);
+    dim3 qkt_blocks((N+ATTN_TILE-1)/ATTN_TILE, (N+ATTN_TILE-1)/ATTN_TILE);
+    k_qkt<<<qkt_blocks, threads>>>(Q.data_ptr<float>(), K.data_ptr<float>(), S.data_ptr<float>(), N, d);
+
+    // Row-wise softmax over N×N score matrix
+    k_row_softmax<<<(N+255)/256, 256>>>(S.data_ptr<float>(), N);
+
+    // Weighted sum S @ V
+    dim3 sv_blocks((d+ATTN_TILE-1)/ATTN_TILE, (N+ATTN_TILE-1)/ATTN_TILE);
+    k_sv<<<sv_blocks, threads>>>(S.data_ptr<float>(), V.data_ptr<float>(), O.data_ptr<float>(), N, d);
+
+    return O;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv1d",  &conv1d);
-    m.def("conv2d",  &conv2d);
-    m.def("matmul",  &matmul);
-    m.def("softmax", &softmax);
+    m.def("conv1d",          &conv1d);
+    m.def("conv2d",          &conv2d);
+    m.def("matmul",          &matmul);
+    m.def("softmax",         &softmax);
+    m.def("attention_naive", &attention_naive);
 }
