@@ -126,6 +126,88 @@ torch::Tensor softmax(torch::Tensor input) {
 }
 
 
+// Streaming softmax: (max, sum) stay on device, no DtoH sync
+__global__ void k_stream_reduce(const float* in, float* out_max, float* out_sum, int N) {
+    __shared__ float s_max[1024], s_sum[1024];
+    int tid = threadIdx.x, idx = blockIdx.x * blockDim.x + tid;
+    // Load element, seed its running count to 1
+    s_max[tid] = idx < N ? in[idx] : -INFINITY;
+    s_sum[tid] = idx < N ? 1.0f : 0.0f;
+    __syncthreads();
+    // Combine pairs via online (max, sum) correction
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ma = s_max[tid], da = s_sum[tid];
+            float mb = s_max[tid+s], db = s_sum[tid+s];
+            float m = fmaxf(ma, mb);
+            s_max[tid] = m;
+            s_sum[tid] = da * expf(ma-m) + db * expf(mb-m);
+        }
+        __syncthreads();
+    }
+    // First thread writes the block's (max, sum) pair
+    if (tid == 0) { out_max[blockIdx.x] = s_max[0]; out_sum[blockIdx.x] = s_sum[0]; }
+}
+
+__global__ void k_stream_merge(const float* in_max, const float* in_sum,
+                                float* out_max, float* out_sum, int n) {
+    __shared__ float s_max[1024], s_sum[1024];
+    int tid = threadIdx.x, idx = blockIdx.x * blockDim.x + tid;
+    // Load one block-level (max, sum) pair per thread
+    s_max[tid] = idx < n ? in_max[idx] : -INFINITY;
+    s_sum[tid] = idx < n ? in_sum[idx] : 0.0f;
+    __syncthreads();
+    // Combine pairs via online (max, sum) correction
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ma = s_max[tid], da = s_sum[tid];
+            float mb = s_max[tid+s], db = s_sum[tid+s];
+            float m = fmaxf(ma, mb);
+            s_max[tid] = m;
+            s_sum[tid] = da * expf(ma-m) + db * expf(mb-m);
+        }
+        __syncthreads();
+    }
+    // First thread writes the merged (max, sum) pair
+    if (tid == 0) { out_max[blockIdx.x] = s_max[0]; out_sum[blockIdx.x] = s_sum[0]; }
+}
+
+__global__ void k_stream_normalize(const float* in, float* out,
+                                    const float* g_max, const float* g_sum, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // Subtract the global max, exponentiate, and divide by the global sum
+    if (i < N) out[i] = expf(in[i] - g_max[0]) / g_sum[0];
+}
+
+torch::Tensor softmax_streaming(torch::Tensor input) {
+    input = input.contiguous();
+    int N = input.size(0);
+    auto out  = torch::empty_like(input);
+    auto opts = input.options();
+    int cur   = (N + 1023) / 1024;
+
+    // First pass: one (max, sum) pair per block
+    auto d_max = torch::empty({cur}, opts);
+    auto d_sum = torch::empty({cur}, opts);
+    k_stream_reduce<<<cur, 1024>>>(input.data_ptr<float>(),
+                                   d_max.data_ptr<float>(), d_sum.data_ptr<float>(), N);
+
+    // Merge block pairs until a single global (max, sum) remains
+    while (cur > 1) {
+        int next = (cur + 1023) / 1024;
+        auto tmp_max = torch::empty({next}, opts);
+        auto tmp_sum = torch::empty({next}, opts);
+        k_stream_merge<<<next, 1024>>>(d_max.data_ptr<float>(), d_sum.data_ptr<float>(),
+                                       tmp_max.data_ptr<float>(), tmp_sum.data_ptr<float>(), cur);
+        d_max = tmp_max; d_sum = tmp_sum; cur = next;
+    }
+
+    // Subtract the global max, exponentiate, and divide by the global sum
+    k_stream_normalize<<<(N+1023)/1024, 1024>>>(input.data_ptr<float>(), out.data_ptr<float>(),
+                                                 d_max.data_ptr<float>(), d_sum.data_ptr<float>(), N);
+    return out;
+}
+
 // ── Attention kernels ────────────────────────────────────────────────────────
 
 #define ATTN_TILE 16
@@ -196,9 +278,10 @@ torch::Tensor attention_naive(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv1d",          &conv1d);
-    m.def("conv2d",          &conv2d);
-    m.def("matmul",          &matmul);
-    m.def("softmax",         &softmax);
-    m.def("attention_naive", &attention_naive);
+    m.def("conv1d",            &conv1d);
+    m.def("conv2d",            &conv2d);
+    m.def("matmul",            &matmul);
+    m.def("softmax",           &softmax);
+    m.def("softmax_streaming", &softmax_streaming);
+    m.def("attention_naive",   &attention_naive);
 }
