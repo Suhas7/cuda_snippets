@@ -85,12 +85,14 @@ tc  = bench("custom/matmul", ops.matmul, A, B)
 tt  = bench("torch/matmul",  torch.mm, A, B)
 print(f"{'matmul (1024^3)':<{W}} {tc:>10.4f} {tt:>10.4f} {tt/tc:>6.2f}x  {achieved_tflops(2*M*N*K,tc):.3f} TFLOPS (custom)  {achieved_tflops(2*M*N*K,tt):.3f} TFLOPS (torch/cuBLAS)")
 
-# softmax (memory-bound: read + write)
+# softmax variants (memory-bound: read + write)
 xs  = torch.randn(1 << 20, device=dev)
 mem = 2 * xs.numel() * xs.element_size()
-tc  = bench("custom/softmax", ops.softmax, xs)
-tt  = bench("torch/softmax",  F.softmax, xs, 0)
-print(f"{'softmax (1M elems)':<{W}} {tc:>10.4f} {tt:>10.4f} {tt/tc:>6.2f}x  {achieved_bw(mem,tc):.1f} GB/s")
+tc  = bench("custom/softmax",    ops.softmax, xs)
+ts  = bench("stream/softmax",    ops.softmax_streaming, xs)
+tt  = bench("torch/softmax",     F.softmax, xs, 0)
+print(f"{'softmax/naive (1M)':<{W}} {tc:>10.4f} {tt:>10.4f} {tt/tc:>6.2f}x  {achieved_bw(mem,tc):.1f} GB/s")
+print(f"{'softmax/streaming (1M)':<{W}} {ts:>10.4f} {tt:>10.4f} {tt/ts:>6.2f}x  {achieved_bw(mem,ts):.1f} GB/s")
 
 # ---------------------------------------------------------------------------
 # Matmul size sweep — shows where naive tiling falls apart vs cuBLAS
@@ -116,8 +118,9 @@ for n in [128, 256, 512, 1024, 2048]:
 print()
 print("CUDA kernel breakdown — softmax (torch.profiler, 50 iters)")
 for label, fn, args in [
-    ("custom", ops.softmax, (xs,)),
-    ("torch",  F.softmax,  (xs, 0)),
+    ("custom/naive",     ops.softmax,           (xs,)),
+    ("custom/streaming", ops.softmax_streaming,  (xs,)),
+    ("torch",            F.softmax,             (xs, 0)),
 ]:
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA],
