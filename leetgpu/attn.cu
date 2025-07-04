@@ -22,6 +22,8 @@ __global__ void flash_attn(const float* Q, const float* K, const float* V,
         o_acc[dk] = 0.0f;
     __syncthreads();
 
+    // Running softmax state: row max and denominator
+    float m = -INFINITY, denom = 0.0f;
     float inv_sqrt_d = rsqrtf((float)d);
 
     // Stream over K/V tiles
@@ -63,7 +65,14 @@ __global__ void flash_attn(const float* Q, const float* K, const float* V,
             __syncthreads();
         }
         float d_tile = tmp[0];
-        (void)d_tile;
+
+        // Online update: merge running (m, denom) with this tile's (m_tile, d_tile)
+        float m_new  = fmaxf(m, m_tile);
+        float old_sc = expf(m - m_new);
+        float new_sc = expf(m_tile - m_new);
+        denom = denom * old_sc + d_tile * new_sc;
+        m     = m_new;
+        (void)old_sc; (void)new_sc;
     }
 
     for (int dk = tid; dk < d; dk += blockDim.x)
