@@ -72,7 +72,18 @@ __global__ void flash_attn(const float* Q, const float* K, const float* V,
         float new_sc = expf(m_tile - m_new);
         denom = denom * old_sc + d_tile * new_sc;
         m     = m_new;
-        (void)old_sc; (void)new_sc;
+
+        // Rescale existing o_acc and accumulate this tile's V contribution.
+        // Each thread owns the dk slice {tid, tid+Bc, tid+2*Bc, ...} of o_acc,
+        // so it loops over all j in the tile — no atomics, no cross-thread conflict.
+        for (int dk = tid; dk < d; dk += blockDim.x) {
+            o_acc[dk] *= old_sc;
+            for (int jj = 0; jj < Bc; jj++) {
+                if (j_base + jj < N)
+                    o_acc[dk] += exp_sc[jj] * new_sc * V_tile[jj * d + dk];
+            }
+        }
+        __syncthreads();  // protect smem before next tile load
     }
 
     for (int dk = tid; dk < d; dk += blockDim.x)
