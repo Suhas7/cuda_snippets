@@ -45,3 +45,17 @@ ts  = bench(ops.softmax_streaming, xs)
 tt  = bench(F.softmax, xs, 0)
 print(f"{'softmax':<14} {tc:>12.4f} {tt:>12.4f}")
 print(f"{'softmax_stream':<14} {ts:>12.4f} {tt:>12.4f}")
+
+N, d = 1024, 64
+Q  = torch.randn(N, d, device=dev)
+K  = torch.randn(N, d, device=dev)
+V  = torch.randn(N, d, device=dev)
+def torch_attn(q, k, v):
+    return F.scaled_dot_product_attention(q.unsqueeze(0).unsqueeze(0),
+                                          k.unsqueeze(0).unsqueeze(0),
+                                          v.unsqueeze(0).unsqueeze(0)).squeeze()
+tc  = bench(ops.attention_naive, Q, K, V)
+tf  = bench(ops.attention_flash, Q, K, V)
+tt  = bench(torch_attn, Q, K, V)
+print(f"{'attn/naive':<14} {tc:>12.4f} {tt:>12.4f}")
+print(f"{'attn/flash':<14} {tf:>12.4f} {tt:>12.4f}")

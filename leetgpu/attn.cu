@@ -86,8 +86,9 @@ __global__ void flash_attn(const float* Q, const float* K, const float* V,
         __syncthreads();  // protect smem before next tile load
     }
 
+    // Normalize by the accumulated denominator
     for (int dk = tid; dk < d; dk += blockDim.x)
-        O[i * d + dk] = o_acc[dk];
+        O[i * d + dk] = o_acc[dk] / denom;
 }
 
 void solve(const float* Q, const float* K, const float* V, float* O, int N, int d) {
