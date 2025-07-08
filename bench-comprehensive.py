@@ -94,6 +94,24 @@ tt  = bench("torch/softmax",     F.softmax, xs, 0)
 print(f"{'softmax/naive (1M)':<{W}} {tc:>10.4f} {tt:>10.4f} {tt/tc:>6.2f}x  {achieved_bw(mem,tc):.1f} GB/s")
 print(f"{'softmax/streaming (1M)':<{W}} {ts:>10.4f} {tt:>10.4f} {tt/ts:>6.2f}x  {achieved_bw(mem,ts):.1f} GB/s")
 
+# attention (compute+memory bound; FLOPs = 4*N²*d)
+N_attn, d_attn = 1024, 64
+Q = torch.randn(N_attn, d_attn, device=dev)
+K = torch.randn(N_attn, d_attn, device=dev)
+V = torch.randn(N_attn, d_attn, device=dev)
+attn_flops = 4 * N_attn**2 * d_attn
+
+def torch_attn(q, k, v):
+    return F.scaled_dot_product_attention(q.unsqueeze(0).unsqueeze(0),
+                                          k.unsqueeze(0).unsqueeze(0),
+                                          v.unsqueeze(0).unsqueeze(0)).squeeze()
+
+tc = bench("naive/attn",  ops.attention_naive, Q, K, V)
+tf = bench("flash/attn",  ops.attention_flash, Q, K, V)
+tt = bench("torch/attn",  torch_attn, Q, K, V)
+print(f"{'attn/naive (N=1024,d=64)':<{W}} {tc:>10.4f} {tt:>10.4f} {tt/tc:>6.2f}x  {achieved_tflops(attn_flops,tc):.3f} TFLOPS")
+print(f"{'attn/flash (N=1024,d=64)':<{W}} {tf:>10.4f} {tt:>10.4f} {tt/tf:>6.2f}x  {achieved_tflops(attn_flops,tf):.3f} TFLOPS")
+
 # ---------------------------------------------------------------------------
 # Matmul size sweep — shows where naive tiling falls apart vs cuBLAS
 # ---------------------------------------------------------------------------
@@ -127,6 +145,24 @@ for label, fn, args in [
         with_stack=False,
     ) as prof:
         for _ in range(50):
+            fn(*args)
+    torch.cuda.synchronize()
+    print(f"\n  [{label}]")
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=6,
+                                    max_name_column_width=52))
+
+print()
+print("CUDA kernel breakdown — attention (torch.profiler, 20 iters)")
+for label, fn, args in [
+    ("naive", ops.attention_naive, (Q, K, V)),
+    ("flash", ops.attention_flash, (Q, K, V)),
+    ("torch", torch_attn,          (Q, K, V)),
+]:
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        with_stack=False,
+    ) as prof:
+        for _ in range(20):
             fn(*args)
     torch.cuda.synchronize()
     print(f"\n  [{label}]")
