@@ -117,6 +117,22 @@ print(f"{'attn/flash (N=1024,d=64)':<{W}} {tf:>10.4f} {tt:>10.4f} {tt/tf:>6.2f}x
 # ---------------------------------------------------------------------------
 
 print()
+print("attention size sweep — naive vs flash vs torch")
+print("(NOTE: flash is currently SLOWER than naive and the gap grows with N —")
+print(" one query row per block (Br=1, 32 threads) gives no K/V reuse and low")
+print(" occupancy. Math is correct; the launch decomposition is the bottleneck.)")
+print(f"  {'N':>5}  {'NxN MB':>7}  {'naive ms':>9}  {'flash ms':>9}  {'torch ms':>9}")
+for n, iters in [(512, 100), (1024, 50), (2048, 20), (4096, 5)]:
+    q = torch.randn(n, d_attn, device=dev)
+    k_s = torch.randn(n, d_attn, device=dev)
+    v_s = torch.randn(n, d_attn, device=dev)
+    nmb = n * n * 4 / 2**20
+    tn = bench(f"naive/attn/{n}", ops.attention_naive, q, k_s, v_s, warmup=3, iters=iters)
+    tf = bench(f"flash/attn/{n}", ops.attention_flash, q, k_s, v_s, warmup=3, iters=iters)
+    tt = bench(f"torch/attn/{n}", torch_attn,          q, k_s, v_s, warmup=3, iters=iters)
+    print(f"  {n:>5}  {nmb:>7.1f}  {tn:>9.3f}  {tf:>9.3f}  {tt:>9.3f}")
+
+print()
 print("matmul size sweep — naive kernel vs cuBLAS (TFLOPS)")
 print(f"  {'N':>5}  {'custom':>8}  {'cublas':>8}  {'ratio':>6}")
 for n in [128, 256, 512, 1024, 2048]:
