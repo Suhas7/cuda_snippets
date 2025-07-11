@@ -4,7 +4,9 @@
 #define BLOCK_SIZE 1024
 
 __global__ void calc_distances(const float* data_x, const float* data_y, int sample_size, float* centroid_x, float* centroid_y, int k, float* distances) {
-    int base = blockIdx.x * ((BLOCK_SIZE / k) * k);
+    // Each block owns blockDim.x = BLOCK_SIZE/k samples (one column of threads
+    // per cluster), so block b covers samples [b*blockDim.x, (b+1)*blockDim.x)
+    int base = blockIdx.x * blockDim.x;
     int sample_id = threadIdx.x;
     int cluster_id = threadIdx.y;
     if (base + sample_id >= sample_size) return;
@@ -70,7 +72,7 @@ void solve(const float* data_x, const float* data_y, int* labels,
     cudaMemcpy(final_centroid_x, initial_centroid_x, sizeof(float) * k, cudaMemcpyDeviceToDevice);
     cudaMemcpy(final_centroid_y, initial_centroid_y, sizeof(float) * k, cudaMemcpyDeviceToDevice);
 
-    int samplesPerBlock = (BLOCK_SIZE / k) * k;
+    int samplesPerBlock = BLOCK_SIZE / k;
     dim3 distThreads(BLOCK_SIZE / k, k);
 
     for (int iter = 0; iter < max_iterations; iter++) {
