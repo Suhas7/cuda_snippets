@@ -1,0 +1,122 @@
+device : NVIDIA GeForce RTX 5070 Ti
+SMs    : 70
+VRAM   : 16 GB
+
+op                        custom ms   torch ms   ratio  metric
+-----------------------------------------------------------------
+conv1d (N=65k, K=32)         0.0131     0.0827   6.30x  39.9 GB/s
+conv2d (512x512, k=5)        0.0141     0.0698   4.95x  147.6 GB/s
+matmul (1024^3)              0.7438     0.0862   0.12x  2.887 TFLOPS (custom)  24.917 TFLOPS (torch/cuBLAS)
+softmax/naive (1M)           0.2876     0.1986   0.69x  29.2 GB/s
+softmax/streaming (1M)       0.0406     0.1986   4.90x  206.9 GB/s
+attn/naive (N=1024,d=64)     0.7577     0.1087   0.14x  0.354 TFLOPS
+attn/flash (N=1024,d=64)     1.4764     0.1087   0.07x  0.182 TFLOPS
+
+attention size sweep — naive vs flash vs torch
+(NOTE: flash is currently SLOWER than naive and the gap grows with N —
+ one query row per block (Br=1, 32 threads) gives no K/V reuse and low
+ occupancy. Math is correct; the launch decomposition is the bottleneck.)
+      N   NxN MB   naive ms   flash ms   torch ms
+    512      1.0      0.351      0.491      0.056
+   1024      4.0      0.747      1.516      0.110
+   2048     16.0      1.696      5.922      0.215
+   4096     64.0      8.507     23.317      0.436
+
+matmul size sweep — naive kernel vs cuBLAS (TFLOPS)
+      N    custom    cublas   ratio
+    128     0.181     0.188   0.96x
+    256     1.300     1.485   0.87x
+    512     2.463     3.237   0.76x
+   1024     2.899    25.084   0.12x
+   2048     2.979    30.763   0.10x
+
+CUDA kernel breakdown — softmax (torch.profiler, 50 iters)
+/home/suhas/miniconda3/envs/bench/lib/python3.12/site-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+
+  [custom/naive]
+-----------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                           Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls
+-----------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+        k_reduce_max(float const*, float*, int)         0.00%       0.000us         0.00%       0.000us       0.000us       1.167ms        40.72%       1.167ms      11.674us           100
+        k_reduce_sum(float const*, float*, int)         0.00%       0.000us         0.00%       0.000us       0.000us       1.158ms        40.41%       1.158ms      11.585us           100
+    k_sub_exp(float const*, float*, int, float)         0.00%       0.000us         0.00%       0.000us       0.000us     256.407us         8.94%     256.407us       5.128us            50
+                      k_div(float*, int, float)         0.00%       0.000us         0.00%       0.000us       0.000us     252.000us         8.79%     252.000us       5.040us            50
+               Memcpy DtoH (Device -> Pageable)         0.00%       0.000us         0.00%       0.000us       0.000us      32.640us         1.14%      32.640us       0.326us           100
+                               cudaLaunchKernel        25.89%       5.068ms        30.28%       5.927ms      19.757us       0.000us         0.00%       0.000us       0.000us           300
+-----------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 19.573ms
+Self CUDA time total: 2.867ms
+
+
+  [custom/streaming]
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                                Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+k_stream_reduce(float const*, float*, float*, int...         0.00%       0.000us         0.00%       0.000us       0.000us     996.267us        65.15%     996.267us      19.925us            50
+k_stream_normalize(float const*, float*, float co...         0.00%       0.000us         0.00%       0.000us       0.000us     445.047us        29.10%     445.047us       8.901us            50
+k_stream_merge(float const*, float const*, float*...         0.00%       0.000us         0.00%       0.000us       0.000us      87.904us         5.75%      87.904us       1.758us            50
+                                    cudaLaunchKernel        29.91%     648.418us        58.96%       1.278ms       8.522us       0.000us         0.00%       0.000us       0.000us           150
+                             Activity Buffer Request        29.05%     629.839us        29.05%     629.839us     629.839us       0.000us         0.00%       0.000us       0.000us             1
+                               cudaDeviceSynchronize        41.04%     889.885us        41.04%     889.885us     889.885us       0.000us         0.00%       0.000us       0.000us             1
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 2.168ms
+Self CUDA time total: 1.529ms
+
+
+  [torch]
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                                Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+void at::native::(anonymous namespace)::cunn_Soft...         0.00%       0.000us         0.00%       0.000us       0.000us      10.078ms       100.00%      10.078ms     201.564us            50
+                                    cudaLaunchKernel         2.17%     229.182us         7.86%     828.325us      16.567us       0.000us         0.00%       0.000us       0.000us            50
+                             Activity Buffer Request         5.69%     599.143us         5.69%     599.143us     599.143us       0.000us         0.00%       0.000us       0.000us             1
+                               cudaDeviceSynchronize        92.14%       9.710ms        92.14%       9.710ms       9.710ms       0.000us         0.00%       0.000us       0.000us             1
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 10.539ms
+Self CUDA time total: 10.078ms
+
+
+CUDA kernel breakdown — attention (torch.profiler, 20 iters)
+
+  [naive]
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+                          k_row_softmax(float*, int)         0.00%       0.000us         0.00%       0.000us       0.000us      12.758ms        84.01%      12.758ms     637.919us            20
+k_qkt(float const*, float const*, float*, int, in...         0.00%       0.000us         0.00%       0.000us       0.000us       1.457ms         9.59%       1.457ms      72.831us            20
+k_sv(float const*, float const*, float*, int, int...         0.00%       0.000us         0.00%       0.000us       0.000us     897.075us         5.91%     897.075us      44.854us            20
+void at::native::vectorized_elementwise_kernel<4,...         0.00%       0.000us         0.00%       0.000us       0.000us      75.296us         0.50%      75.296us       1.882us            40
+                                    cudaLaunchKernel         9.60%       1.472ms        14.09%       2.161ms      21.606us       0.000us         0.00%       0.000us       0.000us           100
+                             Activity Buffer Request         4.49%     689.042us         4.49%     689.042us     689.042us       0.000us         0.00%       0.000us       0.000us             1
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 15.335ms
+Self CUDA time total: 15.187ms
+
+
+  [flash]
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+k_flash_attn(float const*, float const*, float co...         0.00%       0.000us         0.00%       0.000us       0.000us      30.262ms        99.95%      30.262ms       1.513ms            20
+void at::native::vectorized_elementwise_kernel<4,...         0.00%       0.000us         0.00%       0.000us       0.000us      14.827us         0.05%      14.827us       0.741us            20
+                                    cudaLaunchKernel         1.37%     426.143us         3.55%       1.102ms      27.543us       0.000us         0.00%       0.000us       0.000us            40
+                             Activity Buffer Request         2.18%     675.565us         2.18%     675.565us     675.565us       0.000us         0.00%       0.000us       0.000us             1
+                               cudaDeviceSynchronize        96.45%      29.899ms        96.45%      29.899ms      29.899ms       0.000us         0.00%       0.000us       0.000us             1
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 31.000ms
+Self CUDA time total: 30.277ms
+
+
+  [torch]
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                                Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+fmha_cutlassF_f32_aligned_64x64_rf_sm80(PyTorchMe...         0.00%       0.000us         0.00%       0.000us       0.000us       2.194ms       100.00%       2.194ms     109.716us            20
+                               cudaStreamIsCapturing         0.25%       6.759us         0.25%       6.759us       0.338us       0.000us         0.00%       0.000us       0.000us            20
+                             Activity Buffer Request        21.87%     583.796us        21.87%     583.796us     583.796us       0.000us         0.00%       0.000us       0.000us             1
+                                    cudaLaunchKernel         6.87%     183.313us         6.87%     183.313us       9.166us       0.000us         0.00%       0.000us       0.000us            20
+                               cudaDeviceSynchronize        71.01%       1.896ms        71.01%       1.896ms       1.896ms       0.000us         0.00%       0.000us       0.000us             1
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 2.670ms
+Self CUDA time total: 2.194ms

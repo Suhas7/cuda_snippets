@@ -1,0 +1,9 @@
+op              custom (ms)   torch (ms)
+----------------------------------------
+conv1d               0.0960       0.0742
+conv2d               0.0879       0.0152
+matmul               0.1094       0.0210
+softmax              0.4960       0.0426
+softmax_stream       0.1042       0.0426
+attn/naive           0.7467       0.1090
+attn/flash           1.4714       0.1090
