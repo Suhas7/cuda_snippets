@@ -56,6 +56,8 @@ def torch_attn(q, k, v):
                                           v.unsqueeze(0).unsqueeze(0)).squeeze()
 tc  = bench(ops.attention_naive, Q, K, V)
 tf  = bench(ops.attention_flash, Q, K, V)
+tf2 = bench(ops.attention_flash_v2, Q, K, V)
 tt  = bench(torch_attn, Q, K, V)
 print(f"{'attn/naive':<14} {tc:>12.4f} {tt:>12.4f}")
 print(f"{'attn/flash':<14} {tf:>12.4f} {tt:>12.4f}")
+print(f"{'attn/flash_v2':<14} {tf2:>12.4f} {tt:>12.4f}")

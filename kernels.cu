@@ -376,6 +376,124 @@ torch::Tensor attention_flash(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
     return O;
 }
 
+
+// Flash attention v2: fixes the two structural issues in k_flash_attn above.
+//   1. k_flash_attn used Br=1 (one query row per block), so every block
+//      re-streamed the whole K/V matrix from HBM to serve a single row --
+//      O(N^2 d) traffic with none of flash attention's reuse payoff.
+//   2. ATTN_Bc=32 threads did a shared-mem tree reduction (with
+//      __syncthreads() at every step) for what is, at 32 threads, exactly
+//      one warp.
+// Fix: FLASH_Br=32 query rows per block, one warp per row (blockDim =
+// (FLASH_Bc, FLASH_Br) with FLASH_Bc == warpSize, so threadIdx.x is the
+// warp lane). The K/V tile loads into shared memory ONCE per block and is
+// reused by all 32 row-warps; the per-row max/sum reduction over the tile
+// is a warp shuffle instead of a shared-mem tree.
+#define FLASH_Bc 32
+#define FLASH_Br 32
+
+__global__ void k_flash_attn_v2(const float* Q, const float* K, const float* V,
+                                 float* O, int N, int d) {
+    int row  = threadIdx.y;                       // this warp's row within the Br tile
+    int lane = threadIdx.x;                        // lane within the warp / column within the Bc tile
+    int i    = blockIdx.x * FLASH_Br + row;         // global query row index
+
+    extern __shared__ float smem[];
+    float* Q_tile = smem;                                     // [Br][d]  loaded once, reused across all K/V tiles
+    float* K_tile = Q_tile + FLASH_Br * d;                     // [Bc][d]
+    float* V_tile = K_tile + FLASH_Bc * d;                     // [Bc][d]
+    float* o_acc  = V_tile + FLASH_Bc * d;                     // [Br][d]
+    float* exp_sc = o_acc + FLASH_Br * d;                      // [Br][Bc]
+    float* row_m     = exp_sc + FLASH_Br * FLASH_Bc;           // [Br]
+    float* row_denom = row_m + FLASH_Br;                       // [Br]
+
+    for (int dk = lane; dk < d; dk += FLASH_Bc)
+        Q_tile[row * d + dk] = (i < N) ? Q[i * d + dk] : 0.0f;
+
+    for (int dk = lane; dk < d; dk += FLASH_Bc)
+        o_acc[row * d + dk] = 0.0f;
+    if (lane == 0) { row_m[row] = -INFINITY; row_denom[row] = 0.0f; }
+    __syncthreads();
+
+    float inv_sqrt_d = rsqrtf((float)d);
+
+    for (int t = 0; t < (N + FLASH_Bc - 1) / FLASH_Bc; t++) {
+        int j_base = t * FLASH_Bc;
+
+        // Cooperative load of this K/V tile, once for the whole block --
+        // all FLASH_Br=32 row-warps below reuse it (this is the actual
+        // fix: the old kernel reloaded K/V from scratch per query row).
+        for (int k = row * FLASH_Bc + lane; k < FLASH_Bc * d; k += FLASH_Br * FLASH_Bc) {
+            int jj = j_base + k / d, dk = k % d;
+            K_tile[k] = jj < N ? K[jj * d + dk] : 0.0f;
+            V_tile[k] = jj < N ? V[jj * d + dk] : 0.0f;
+        }
+        __syncthreads();
+
+        // Each lane scores this row against one column of the tile.
+        int j = j_base + lane;
+        float score = -INFINITY;
+        if (i < N && j < N) {
+            score = 0.0f;
+            for (int dk = 0; dk < d; dk++)
+                score += Q_tile[row * d + dk] * K_tile[lane * d + dk];
+            score *= inv_sqrt_d;
+        }
+
+        // Warp-shuffle max/sum over the Bc dimension -- FLASH_Bc ==
+        // warpSize, so this replaces the shared-mem tree reduction +
+        // __syncthreads() the old kernel used.
+        float m_tile = score;
+        for (int off = 16; off > 0; off >>= 1)
+            m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffff, m_tile, off));
+
+        float p = (i < N && j < N) ? expf(score - m_tile) : 0.0f;
+        exp_sc[row * FLASH_Bc + lane] = p;
+        float d_tile = p;
+        for (int off = 16; off > 0; off >>= 1)
+            d_tile += __shfl_xor_sync(0xffffffff, d_tile, off);
+
+        // Online update of this row's running (max, denom).
+        float m_prev  = row_m[row];
+        float m_new   = fmaxf(m_prev, m_tile);
+        float old_sc  = expf(m_prev - m_new);
+        float new_sc  = expf(m_tile - m_new);
+        if (lane == 0) {
+            row_denom[row] = row_denom[row] * old_sc + d_tile * new_sc;
+            row_m[row]     = m_new;
+        }
+
+        // Rescale o_acc and accumulate this tile's V contribution. Each
+        // lane owns dk = lane, lane+FLASH_Bc, ... and loops the Bc columns.
+        for (int dk = lane; dk < d; dk += FLASH_Bc) {
+            float acc = o_acc[row * d + dk] * old_sc;
+            for (int jj = 0; jj < FLASH_Bc; jj++)
+                acc += exp_sc[row * FLASH_Bc + jj] * new_sc * V_tile[jj * d + dk];
+            o_acc[row * d + dk] = acc;
+        }
+        __syncthreads();  // protect K/V tile + exp_sc before next iteration
+    }
+
+    if (i < N) {
+        float denom = row_denom[row];
+        for (int dk = lane; dk < d; dk += FLASH_Bc)
+            O[i * d + dk] = o_acc[row * d + dk] / denom;
+    }
+}
+
+torch::Tensor attention_flash_v2(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
+    Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous();
+    int N = Q.size(0), d = Q.size(1);
+    auto O = torch::zeros({N, d}, Q.options());
+    dim3 threads(FLASH_Bc, FLASH_Br);
+    dim3 blocks((N + FLASH_Br - 1) / FLASH_Br);
+    size_t smem = (2 * FLASH_Br * d + 2 * FLASH_Bc * d + FLASH_Br * FLASH_Bc + 2 * FLASH_Br) * sizeof(float);
+    cudaFuncSetAttribute(k_flash_attn_v2, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    k_flash_attn_v2<<<blocks, threads, smem>>>(Q.data_ptr<float>(), K.data_ptr<float>(),
+                                                V.data_ptr<float>(), O.data_ptr<float>(), N, d);
+    return O;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("conv1d",            &conv1d);
     m.def("conv2d",            &conv2d);
@@ -384,4 +502,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("softmax_streaming", &softmax_streaming);
     m.def("attention_naive",   &attention_naive);
     m.def("attention_flash",   &attention_flash);
+    m.def("attention_flash_v2", &attention_flash_v2);
 }

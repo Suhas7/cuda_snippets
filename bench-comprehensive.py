@@ -106,31 +106,44 @@ def torch_attn(q, k, v):
                                           k.unsqueeze(0).unsqueeze(0),
                                           v.unsqueeze(0).unsqueeze(0)).squeeze()
 
-tc = bench("naive/attn",  ops.attention_naive, Q, K, V)
-tf = bench("flash/attn",  ops.attention_flash, Q, K, V)
-tt = bench("torch/attn",  torch_attn, Q, K, V)
+tc  = bench("naive/attn",     ops.attention_naive,    Q, K, V)
+tf  = bench("flash/attn",     ops.attention_flash,    Q, K, V)
+tf2 = bench("flash_v2/attn",  ops.attention_flash_v2, Q, K, V)
+tt  = bench("torch/attn",     torch_attn, Q, K, V)
 print(f"{'attn/naive (N=1024,d=64)':<{W}} {tc:>10.4f} {tt:>10.4f} {tt/tc:>6.2f}x  {achieved_tflops(attn_flops,tc):.3f} TFLOPS")
 print(f"{'attn/flash (N=1024,d=64)':<{W}} {tf:>10.4f} {tt:>10.4f} {tt/tf:>6.2f}x  {achieved_tflops(attn_flops,tf):.3f} TFLOPS")
+print(f"{'attn/flash_v2 (N=1024,d=64)':<{W}} {tf2:>10.4f} {tt:>10.4f} {tt/tf2:>6.2f}x  {achieved_tflops(attn_flops,tf2):.3f} TFLOPS")
+
+# Correctness check: flash_v2 is a fresh kernel with a different launch
+# shape (Br=32 rows/block, warp-shuffle reduction), so verify against
+# torch's SDPA output before trusting the latency numbers above.
+ref = torch_attn(Q, K, V)
+got = ops.attention_flash_v2(Q, K, V)
+max_err = (ref - got).abs().max().item()
+print(f"\nflash_v2 max abs error vs torch SDPA: {max_err:.2e} "
+      f"({'OK' if max_err < 1e-2 else 'CHECK THIS -- looks wrong'})")
 
 # ---------------------------------------------------------------------------
 # Matmul size sweep — shows where naive tiling falls apart vs cuBLAS
 # ---------------------------------------------------------------------------
 
 print()
-print("attention size sweep — naive vs flash vs torch")
-print("(NOTE: flash is currently SLOWER than naive and the gap grows with N —")
-print(" one query row per block (Br=1, 32 threads) gives no K/V reuse and low")
-print(" occupancy. Math is correct; the launch decomposition is the bottleneck.)")
-print(f"  {'N':>5}  {'NxN MB':>7}  {'naive ms':>9}  {'flash ms':>9}  {'torch ms':>9}")
+print("attention size sweep — naive vs flash vs flash_v2 vs torch")
+print("(flash is SLOWER than naive and the gap grows with N — one query row")
+print(" per block (Br=1, 32 threads) gives no K/V reuse and low occupancy.")
+print(" flash_v2 fixes this with Br=32 rows/block sharing one K/V tile load")
+print(" plus warp-shuffle reduction instead of a shared-mem tree.)")
+print(f"  {'N':>5}  {'NxN MB':>7}  {'naive ms':>9}  {'flash ms':>9}  {'flash_v2 ms':>11}  {'torch ms':>9}")
 for n, iters in [(512, 100), (1024, 50), (2048, 20), (4096, 5)]:
     q = torch.randn(n, d_attn, device=dev)
     k_s = torch.randn(n, d_attn, device=dev)
     v_s = torch.randn(n, d_attn, device=dev)
     nmb = n * n * 4 / 2**20
-    tn = bench(f"naive/attn/{n}", ops.attention_naive, q, k_s, v_s, warmup=3, iters=iters)
-    tf = bench(f"flash/attn/{n}", ops.attention_flash, q, k_s, v_s, warmup=3, iters=iters)
-    tt = bench(f"torch/attn/{n}", torch_attn,          q, k_s, v_s, warmup=3, iters=iters)
-    print(f"  {n:>5}  {nmb:>7.1f}  {tn:>9.3f}  {tf:>9.3f}  {tt:>9.3f}")
+    tn  = bench(f"naive/attn/{n}",     ops.attention_naive,    q, k_s, v_s, warmup=3, iters=iters)
+    tf  = bench(f"flash/attn/{n}",     ops.attention_flash,    q, k_s, v_s, warmup=3, iters=iters)
+    tf2 = bench(f"flash_v2/attn/{n}",  ops.attention_flash_v2, q, k_s, v_s, warmup=3, iters=iters)
+    tt  = bench(f"torch/attn/{n}",     torch_attn,             q, k_s, v_s, warmup=3, iters=iters)
+    print(f"  {n:>5}  {nmb:>7.1f}  {tn:>9.3f}  {tf:>9.3f}  {tf2:>11.3f}  {tt:>9.3f}")
 
 print()
 print("matmul size sweep — naive kernel vs cuBLAS (TFLOPS)")
@@ -170,9 +183,10 @@ for label, fn, args in [
 print()
 print("CUDA kernel breakdown — attention (torch.profiler, 20 iters)")
 for label, fn, args in [
-    ("naive", ops.attention_naive, (Q, K, V)),
-    ("flash", ops.attention_flash, (Q, K, V)),
-    ("torch", torch_attn,          (Q, K, V)),
+    ("naive",    ops.attention_naive,    (Q, K, V)),
+    ("flash",    ops.attention_flash,    (Q, K, V)),
+    ("flash_v2", ops.attention_flash_v2, (Q, K, V)),
+    ("torch",    torch_attn,             (Q, K, V)),
 ]:
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA],
